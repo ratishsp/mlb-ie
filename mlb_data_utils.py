@@ -283,6 +283,7 @@ def get_datasets(path="../boxscore-data/rotowire"):
         
     extracted_stuff = []
     datasets = [trdata, valdata, testdata]
+    prons = None
     for dataset in datasets:
         nugz = []
         for i, entry in enumerate(dataset):
@@ -485,6 +486,7 @@ def prep_generated_data(genfile, dict_pfx, outfile, path="../boxscore-data/mlb",
     nugz = [] # to hold (sentence_tokens, [rels]) tuples
     sent_reset_indices_count = Counter() # sentence indices where a box/story is reset
     sent_reset_indices_count[0] += 1
+    prons = None
     for i, entry in enumerate(valdata):
         summ = gens[i]
         all_ents, players, teams, cities = get_ents(entry)
