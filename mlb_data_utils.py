@@ -1,6 +1,7 @@
 import codecs, json, os
 from collections import Counter, OrderedDict
-from nltk import sent_tokenize, word_tokenize
+from nltk import sent_tokenize
+from nltk.corpus import stopwords
 import numpy as np
 import h5py
 import random
@@ -23,33 +24,58 @@ class DefaultListOrderedDict(OrderedDict):
         return self[k]
 
 
+
+def get_team_information(thing, home):
+    teams = set()
+    if home:
+        team_type = "home_"
+    else:
+        team_type = "vis_"
+
+    teams.add(thing[team_type + "name"])
+    teams.add(" ".join([thing[team_type + "city"], thing[team_type + "name"]]))
+
+    alternate_names = {"D-backs": "Diamondbacks", "Diamondbacks": "D-backs", "Athletics": "A 's"}
+    for key in alternate_names:
+        if thing[team_type + "name"] == key:
+            teams.add(" ".join([thing[team_type + "city"], alternate_names[key]]))
+            teams.add(alternate_names[key])
+    return teams
+
+
+def get_city_information(thing, home):
+    cities = set()
+    if home:
+        team_type = "home_"
+    else:
+        team_type = "vis_"
+    cities.add(thing[team_type + "city"])
+
+    alternate_names = {"Chi Cubs": ["Chicago"], "LA Angels": ["Los Angeles", "LA"], "LA Dodgers": ["Los Angeles", "LA"],
+                       "NY Yankees": ["New York", "NY"], "NY Mets": ["New York", "NY"], "Chi White Sox": ["Chicago"]}
+    for key in alternate_names:
+        if thing[team_type + "city"] == key:
+            for val in alternate_names[key]:
+                cities.add(val)
+    return cities
+
+
 def get_ents(thing):
     players = set()
     teams = set()
     cities = set()
-
-    teams.add(thing["vis_name"])
-    teams.add(thing["vis_city"] + " " + thing["vis_name"])
-    teams.add(thing["home_name"])
-    teams.add(thing["home_city"] + " " + thing["home_name"])
-    # sometimes team_city is different
-    cities.add(thing["home_city"])
-    cities.add(thing["vis_city"])
+    teams.update(get_team_information(thing, home=False))
+    teams.update(get_team_information(thing, home=True))
+    cities.update(get_city_information(thing, home=False))
+    cities.update(get_city_information(thing, home=True))
     players.update(thing["box_score"]["full_name"].values())
     players.update(thing["box_score"]["last_name"].values())
-
     for entset in [players, teams, cities]:
         for k in list(entset):
             pieces = k.split()
-            if len(pieces) > 1:
-                for piece in pieces:
-                    if len(piece) > 1 and piece not in ["II", "III", "Jr.", "Jr"]:
-                        entset.add(piece)
-                for piece_index in range(1, len(pieces)):
-                    entset.add(" ".join(pieces[0 : piece_index]))
-
+            for piece_index in range(len(pieces)):
+                entset.add(" ".join(pieces[:piece_index]))
     all_ents = players | teams | cities
-
     return all_ents, players, teams, cities
 
 
@@ -110,12 +136,16 @@ def extract_numbers(sent):
 #actions such as single, double, homer
 def extract_intransitive_actions(sent):
     int_actions = []
-    two_word = set(["home run", "home runs"])
-    consider = set(["single", "double", "doubles", "homer", "homers", "scored", "error", "errors", "singled", "doubled", "homered"])
+    two_word = set(["home run", "home runs", "grounded out", "ground out", "flied out", "sacrifice fly"])
+    consider = set(["single", "double", "doubles", "homer", "homers", "scored", "error", "errors", "singled", "doubled",
+                    "homered", "singles", "triple", "triples", "tripled", "walk", "walks", "walked", "groundout", "RBI"])
     toke_action_dict = {"single": "single", "double": "double", "doubles": "double", "homer": "home_run",
                         "homers": "home_run", "home run": "home_run", "scored": "scorer", "error": "fielder_error",
                         "errors": "fielder_error", "singled": "single", "doubled": "double", "homered": "home_run",
-                        "home runs": "home_run"}
+                        "home runs": "home_run", "singles": "single", "triple": "triple", "triples": "triple",
+                        "tripled": "triple", "walk":"walk", "walks":"walk", "walked":"walk", "groundout": "groundout",
+                        "grounded out":"groundout", "ground out":"groundout", "flied out": "flyout",
+                        "sacrifice fly": "sac_fly", "RBI": "rbi"}
     for i in range(len(sent)):
         toke = sent[i]
         if toke in consider:
@@ -125,18 +155,24 @@ def extract_intransitive_actions(sent):
     return int_actions
 
 
-def get_player_idx(bs, entname):
+def get_player_idx(bs, entname, names_map):
     keys = []
     for k, v in bs["full_name"].iteritems():
          if entname == v:
              keys.append(k)
+             names_map[bs["last_name"][k]] = k
+    if len(keys) == 0:
+        if entname in names_map:
+            keys.append(names_map[entname])
     if len(keys) == 0:
         for k,v in bs["last_name"].iteritems():
             if entname == v:
                 keys.append(k)
+                names_map[entname] = k
         if len(keys) > 1: # take the earliest one
             keys.sort(key = lambda x: int(x))
             keys = keys[:1]
+            names_map[entname] = keys[0]
     if len(keys) == 0:
         for k,v in bs["first_name"].iteritems():
             if entname == v:
@@ -147,7 +183,41 @@ def get_player_idx(bs, entname):
     return keys[0] if len(keys) > 0 else None
 
 
-def get_rels(entry, ents, nums, int_actions, players, teams, cities, tokes):
+def get_inning(sent, prev_sent_context, ordinal_adjective_map):
+    inning_identifier = {"first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth",
+                         "7th", "8th", "9th", "10th", "11th", "12th", "13th", "14th", "15th"}
+    inning_identifier_map = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6, "seventh": 7,
+                             "eighth": 8, "ninth": 9, "tenth": 10, "7th": 7, "8th": 8, "9th": 9, "10th": 10, "11th": 11,
+                             "12th": 12, "13th": 13, "14th": 14, "15th": 15}
+    additional_check = {"16th", "17th", "18th", "19th", "20th", "21st", "22nd", "23rd", "24th", "25th", "26th", "27th",
+                        "28th", "29th", "30th"}
+    stops = stopwords.words('english')
+    innings = []
+    upd_sent = " ".join(sent)
+    upd_sent = upd_sent.replace("-", " ").split()  # handles cases such as these: pitched out of a second-inning jam
+    intersected = set(upd_sent).intersection(inning_identifier)
+    if len(intersected) > 0:
+        # candidate present
+        for i in range(len(sent)):
+            if sent[i] in inning_identifier and i+1 < len(sent) and sent[i+1] in ["inning", "innings"]:
+                innings.append((inning_identifier_map[sent[i]], i))
+            elif "-" in sent[i]  and sent[i].split("-")[0] in inning_identifier and sent[i].split("-")[1]  == "inning":
+                innings.append((inning_identifier_map[sent[i].split("-")[0]], i))
+            elif (" ".join(sent[:i]).endswith("in the") or " ".join(sent[:i]).endswith("in the top of the") or " ".join(
+                    sent[:i]).endswith("in the bottom of the")) and sent[i] in inning_identifier and (
+                    (i + 1 < len(sent) and (sent[i + 1] in [".", ","] or sent[i + 1] in stops)) or i + 1 == len(sent)):
+                innings.append((inning_identifier_map[sent[i]], i))
+            elif sent[i] in inning_identifier and ((i+1 < len(sent) and (sent[i+1] in [".", ","] or sent[i+1] in stops)) or i+1 == len(sent)):
+                # i+1 == len(sent) handles the case such as "Kapler also doubled in a run in the first "; no full stop at the end
+                expanded_context = prev_sent_context + sent[:i+1]
+                expanded_context = " ".join(expanded_context)
+                assert expanded_context in ordinal_adjective_map
+                if ordinal_adjective_map[expanded_context] == "True":
+                    innings.append((inning_identifier_map[sent[i]], i))
+    return innings
+
+
+def get_rels(entry, ents, nums, int_actions, players, teams, cities, tokes, innings, names_map):
     """
     this looks at the box/line score and figures out which (entity, number) pairs
     are candidate true relations, and which can't be.
@@ -165,7 +235,7 @@ def get_rels(entry, ents, nums, int_actions, players, teams, cities, tokes):
         entname = ent[2]
         # assume if a player has a city or team name as his name, they won't use that one (e.g., Orlando Johnson)
         if entname in players and entname not in cities and entname not in teams:
-            pidx = get_player_idx(bs, entname)
+            pidx = get_player_idx(bs, entname, names_map)
             for j, numtup in enumerate(nums):
                 found = False
                 strnum = str(numtup[2])
@@ -174,9 +244,9 @@ def get_rels(entry, ents, nums, int_actions, players, teams, cities, tokes):
                         if pidx in col and col[pidx] == strnum: # allow multiple for now
                             if len(tokes) > numtup[1] and tokes[numtup[1]] == "outs" or (len(tokes) > numtup[1] + 1 and tokes[numtup[1]] == "-"  and tokes[numtup[1]+1] == "out"):  # ignore two outs or two - out single
                                 continue
-                            if colname in ["ab", "bb", "hr", "so", "e", "po", "go", "ao", "lob", "d", "r", "cs", "sf", "sac", "t", "hbp", "fldg", "p_hr"]:
+                            if colname in ["ab", "bb", "hr", "so", "e", "po", "go", "ao", "lob", "d", "r", "cs", "sf", "sac", "t", "hbp", "fldg", "p_hr", "rbi"]:
                                 continue
-                            if colname in ["rbi", "p_bs", "p_sv", "p_hld"] and strnum == "0":
+                            if colname in ["p_bs", "p_sv", "p_hld"] and strnum == "0":
                                 continue
                             if len(ents)> i+1 and ent[0] < ents[i+1][0] < numtup[0]:  # if there is another entity in between the current entity and num tuple, ignore
                                 continue
@@ -191,26 +261,49 @@ def get_rels(entry, ents, nums, int_actions, players, teams, cities, tokes):
                                 continue
                             rels.append((ent, numtup, "PLAYER-" + colname, pidx))
                             found = True
+                    if innings:
+                        for colname in ["o", "runs"]:
+                            for inning in innings:
+                                plays = entry["play_by_play"]
+                                if str(inning[0]) not in plays:
+                                    continue
+                                for top_bottom in ["top", "bottom"]:
+                                    inning_plays = plays[str(inning[0])][top_bottom]
+                                    for inning_play in inning_plays:
+                                        if colname == "o" and colname in inning_play and str(inning_play[
+                                            colname]) == strnum and len(tokes) > numtup[1] + 1 and tokes[
+                                            numtup[1]] == "-" and tokes[
+                                            numtup[1] + 1] == "out":
+                                            if "batter" in inning_play and inning_play[
+                                                "batter"] == bs["full_name"][pidx]:
+                                                rels.append((ent, numtup, "P-BY-P-" + colname, pidx))
+                                                found = True
+                                            elif "pitcher" in inning_play and inning_play[
+                                                "pitcher"] == bs["full_name"][pidx]:
+                                                rels.append((ent, numtup, "P-BY-P-" + colname + "_pitcher", pidx))
+                                                found = True
+                                        elif colname == "runs" and colname in inning_play and str(inning_play[
+                                            colname]) == strnum and len(tokes) > numtup[1] + 1 and tokes[
+                                            numtup[1]] == "-" and tokes[
+                                            numtup[1] + 1] == "run":
+                                            if "batter" in inning_play and inning_play[
+                                                "batter"] == bs["full_name"][pidx]:
+                                                rels.append((ent, numtup, "P-BY-P-" + colname, pidx))
+                                                found = True
+                                            elif "pitcher" in inning_play and inning_play[
+                                                "pitcher"] == bs["full_name"][pidx]:
+                                                rels.append((ent, numtup, "P-BY-P-" + colname + "_pitcher", pidx))
+                                                found = True
                 if not found:
                     rels.append((ent, numtup, "NONE", None))
             for j, inttup in enumerate(int_actions):
                 found = False
                 if pidx is not None:
-                    if len(ents) > i + 1 and ent[0] < ents[i + 1][0] < inttup[0]:
-                        # if there is another entity in between the current entity and num tuple, ignore
-                        pass
-                    elif i > 0 and inttup[0] < ents[i - 1][0] < ent[0]:
-                        # if there is another entity in between the current entity and num tuple
-                        # and the order is numtuple ent0 ent1, ignore # check for non pronoun
-                        pass
-                    elif inttup[2] in ["single", "double", "triple", "home_run", "scorer", "fielder_error"] and pidx in \
-                            entry["play_upd"][inttup[2]]:
-                        rels.append((ent, inttup, "P-BY-P-"+inttup[2], pidx))
-                        found = True
-                    elif inttup[2] in ["single", "double", "triple", "home_run"] and pidx in entry["play_upd"][inttup[2]+"_pitcher"]:
-                        rels.append((ent, inttup, "P-BY-P-"+inttup[2]+"_pitcher", pidx))
-                        found = True
-                if not found:
+                    if inttup[2] in ["single", "double", "triple", "home_run", "scorer", "fielder_error", "walk", "groundout", "flyout", "sac_fly", "rbi"] :
+                        found = check_batter_fielder_in_inning(ent, bs["full_name"][pidx], entry, innings, inttup, pidx, rels)
+                        if not found:
+                            found = check_pitcher_in_inning(ent, bs["full_name"][pidx], entry, innings, inttup, pidx, rels)
+                if not found and innings:
                     rels.append((ent, inttup, "NONE", None))
         else: # has to be city or team
             entpieces = entname.split()
@@ -250,46 +343,156 @@ def get_rels(entry, ents, nums, int_actions, players, teams, cities, tokes):
     rels.sort(key=lambda rel: rel[1][0])
     return rels
 
-def append_candidate_rels(entry, summ, all_ents, prons, players, teams, cities, candrels):
+
+def check_pitcher_in_inning(ent, entname, entry, innings, inttup, pidx, rels):
+    found = False
+    if innings:
+        plays = entry["play_by_play"]
+        for inning in innings:
+            if str(inning[0]) not in plays:
+                continue
+            for top_bottom in ["top", "bottom"]:
+                inning_plays = plays[str(inning[0])][top_bottom]
+                for inning_play in inning_plays:
+                    if "pitcher" in inning_play and inning_play["pitcher"] == entname:
+                        for event_candidate in ["single", "double", "triple", "home_run", "walk", "intent_walk", "groundout", "flyout", "sac_fly", "rbi"]:
+                            if inning_play["event"].lower().replace(" ", "_") == event_candidate and inttup[
+                                2] == event_candidate:
+                                rels.append((ent, inttup, "P-BY-P-" + inttup[2] + "_pitcher", pidx))
+                                found = True
+                                return found
+                            elif event_candidate == "intent_walk" and inning_play["event"].lower().replace(" ", "_") == event_candidate and inttup[
+                                2] == "walk":
+                                rels.append((ent, inttup, "P-BY-P-" + inttup[2] + "_pitcher", pidx))
+                                found = True
+                                return found
+                            elif event_candidate == "rbi" and inttup[2] == event_candidate and "rbi" in inning_play and int(inning_play["rbi"]) > 0:
+                                rels.append((ent, inttup, "P-BY-P-" + inttup[2] + "_pitcher", pidx))
+                                found = True
+                                return found
+
+    return found
+
+
+def check_batter_fielder_in_inning(ent, entname, entry, innings, inttup, pidx, rels):
+    found = False
+    if innings:
+        plays = entry["play_by_play"]
+        scorers_attrib = "scorers"
+        for inning in innings:
+            if str(inning[0]) not in plays:
+                continue
+            for top_bottom in ["top", "bottom"]:
+                inning_plays = plays[str(inning[0])][top_bottom]
+                for inning_play in inning_plays:
+                    if "batter" in inning_play and inning_play["batter"] == entname:
+                        for event_candidate in ["single", "double", "triple", "home_run", "walk", "intent_walk", "groundout", "flyout", "sac_fly", "rbi"]:
+                            if inning_play["event"].lower().replace(" ", "_") == event_candidate and inttup[
+                                2] == event_candidate:
+                                rels.append((ent, inttup, "P-BY-P-" + inttup[2], pidx))
+                                found = True
+                                return found
+                            elif event_candidate == "intent_walk" and inning_play["event"].lower().replace(" ", "_") == event_candidate and inttup[
+                                2] == "walk":
+                                rels.append((ent, inttup, "P-BY-P-" + inttup[2], pidx))
+                                found = True
+                                return found
+                            elif event_candidate == "rbi" and inttup[2] == event_candidate and "rbi" in inning_play and int(inning_play["rbi"]) > 0:
+                                rels.append((ent, inttup, "P-BY-P-" + inttup[2], pidx))
+                                found = True
+                                return found
+                    elif "fielder_error" in inning_play and inning_play["fielder_error"] == entname and \
+                            inttup[2] == "fielder_error":
+                        rels.append((ent, inttup, "P-BY-P-" + inttup[2], pidx))
+                        found = True
+                        return found
+                    elif scorers_attrib in inning_play and len(inning_play[scorers_attrib]) > 0 and \
+                            inning_play[scorers_attrib][0] != "N/A" and entname in inning_play[scorers_attrib] and \
+                            inttup[2] == "scorer":
+                        rels.append((ent, inttup, "P-BY-P-" + inttup[2], pidx))
+                        found = True
+                        return found
+    return found
+
+
+def get_ordinal_adjective_map_file_name(ordinal_inning_map_folder, mode):
+    file_list = os.listdir(ordinal_inning_map_folder)
+    for file_name in file_list:
+        if mode in file_name:
+            return os.path.join(ordinal_inning_map_folder, file_name)
+    return None
+
+
+def get_ordinal_adjective_map(ordinal_inning_map_file):
+    ordinal_adjective_map_file = codecs.open(ordinal_inning_map_file, mode="r", encoding="utf-8")
+    ordinal_adjective_map_lines = ordinal_adjective_map_file.readlines()
+    ordinal_adjective_map_lines = [line.strip() for line in ordinal_adjective_map_lines]
+    ordinal_adjective_map = {}
+    for line in ordinal_adjective_map_lines:
+        ordinal_adjective_map[line.split("\t")[0]] = line.split("\t")[1]
+    return ordinal_adjective_map
+
+
+def append_candidate_rels(entry, summ, all_ents, prons, players, teams, cities, candrels, ordinal_adjective_map=None, delimiter=None):
     """
     appends tuples of form (sentence_tokens, [rels]) to candrels
     """
-    sents = sent_tokenize(summ)
+    if delimiter is None:
+        delimiter = " <segment> "
+    names_map = {}
+    sents = summ.split(delimiter)
     for j, sent in enumerate(sents):
         #tokes = word_tokenize(sent)
-        tokes = sent.split()
-        ents = extract_entities(tokes, all_ents, prons)
-        nums = extract_numbers(tokes)
-        int_actions = extract_intransitive_actions(tokes)
-        rels = get_rels(entry, ents, nums, int_actions, players, teams, cities, tokes)
-        if len(rels) > 0:
-            candrels.append((tokes, rels))
+        prev_segment = [] if j == 0 else sents[j - 1].split()
+        innings = get_inning(sent.split(), prev_segment, ordinal_adjective_map)
+        for individual_sent in sent_tokenize(sent):
+            tokes = individual_sent.split()
+            ents = extract_entities(tokes, all_ents, prons)
+            nums = extract_numbers(tokes)
+            int_actions = extract_intransitive_actions(tokes)
+
+            rels = get_rels(entry, ents, nums, int_actions, players, teams, cities, tokes, innings, names_map)
+            if len(rels) > 0:
+                candrels.append((tokes, rels))
     return candrels
 
 
-def get_datasets(path="../boxscore-data/rotowire"):
-    trdata = []
-    for index in range(23):
-        print "train"+str(index)+".json"
-        with codecs.open(os.path.join(path, "train"+str(index)+".json"), "r", "utf-8") as f:
-            trdata.extend(json.load(f))
+def get_datasets(path="../boxscore-data/rotowire", train_index=-1, ordinal_inning_map_file= None):
+    prons = None
+    file_name = get_ordinal_adjective_map_file_name(ordinal_inning_map_file, mode="train")
+    ordinal_adjective_map = get_ordinal_adjective_map(file_name)
+    nugz = []
+    for train_json_index in range(23):
+        print("train" + str(train_json_index) + ".json")
+        with codecs.open(os.path.join(path, "train"+str(train_json_index)+".json"), "r", "utf-8") as f:
+            trdata = json.load(f)
+            for i, entry in enumerate(trdata):
+                all_ents, players, teams, cities = get_ents(entry)
+                summ = " ".join(entry['summary'])
+                append_candidate_rels(entry, summ, all_ents, prons, players, teams, cities, nugz, ordinal_adjective_map, delimiter=" *NEWPARAGRAPH* ")
+    extracted_stuff = []
+    extracted_stuff.append(nugz)
 
-
+    ordinal_adjective_maps = []
     with codecs.open(os.path.join(path, "valid.json"), "r", "utf-8") as f:
         valdata = json.load(f)
+        file_name = get_ordinal_adjective_map_file_name(ordinal_inning_map_file, mode="valid")
+        ordinal_adjective_map = get_ordinal_adjective_map(file_name)
+        ordinal_adjective_maps.append(ordinal_adjective_map)
 
     with codecs.open(os.path.join(path, "test.json"), "r", "utf-8") as f:
         testdata = json.load(f)
-        
-    extracted_stuff = []
-    datasets = [trdata, valdata, testdata]
-    prons = None
-    for dataset in datasets:
+        file_name = get_ordinal_adjective_map_file_name(ordinal_inning_map_file, mode="test")
+        ordinal_adjective_map = get_ordinal_adjective_map(file_name)
+        ordinal_adjective_maps.append(ordinal_adjective_map)
+
+    datasets = [valdata, testdata]
+    for dataset_index, dataset in enumerate(datasets):
         nugz = []
         for i, entry in enumerate(dataset):
             all_ents, players, teams, cities = get_ents(entry)
             summ = " ".join(entry['summary'])
-            append_candidate_rels(entry, summ, all_ents, prons, players, teams, cities, nugz)
+            append_candidate_rels(entry, summ, all_ents, prons, players, teams, cities, nugz, ordinal_adjective_maps[dataset_index], delimiter=" *NEWPARAGRAPH* ")
 
         extracted_stuff.append(nugz)
 
@@ -351,8 +554,8 @@ def append_labelnums(labels):
         labellist.append(labelnums[i])
 
 # for full sentence IE training
-def save_full_sent_data(outfile, path="../boxscore-data/rotowire", multilabel_train=False, nonedenom=0):
-    datasets = get_datasets(path)
+def save_full_sent_data(outfile, path="../boxscore-data/rotowire", train_index=-1, ordinal_inning_map_file=None, multilabel_train=False, nonedenom=0):
+    datasets = get_datasets(path, train_index, ordinal_inning_map_file= ordinal_inning_map_file)
     # make vocab and get labels
     word_counter = Counter()
     [word_counter.update(tup[0]) for tup in datasets[0]]
@@ -457,7 +660,7 @@ def save_full_sent_data(outfile, path="../boxscore-data/rotowire", multilabel_tr
             f.write("%s %d \n" % (revlabels[i], i))
 
 
-def prep_generated_data(genfile, dict_pfx, outfile, path="../boxscore-data/mlb", test=False):
+def prep_generated_data(genfile, dict_pfx, outfile, path="../boxscore-data/mlb", test=False, ordinal_inning_map_file=None):
     # recreate vocab and labeldict
     vocab = {}
     with codecs.open(dict_pfx+".dict", "r", "utf-8") as f:
@@ -482,7 +685,7 @@ def prep_generated_data(genfile, dict_pfx, outfile, path="../boxscore-data/mlb",
         valdata = json.load(f)
 
     #assert len(valdata) == len(trdata)
-
+    ordinal_adjective_map = get_ordinal_adjective_map(ordinal_inning_map_file)
     nugz = [] # to hold (sentence_tokens, [rels]) tuples
     sent_reset_indices_count = Counter() # sentence indices where a box/story is reset
     sent_reset_indices_count[0] += 1
@@ -490,7 +693,7 @@ def prep_generated_data(genfile, dict_pfx, outfile, path="../boxscore-data/mlb",
     for i, entry in enumerate(valdata):
         summ = gens[i]
         all_ents, players, teams, cities = get_ents(entry)
-        append_candidate_rels(entry, summ, all_ents, prons, players, teams, cities, nugz)
+        append_candidate_rels(entry, summ, all_ents, prons, players, teams, cities, nugz, ordinal_adjective_map)
         sent_reset_indices_count[len(nugz)]+=1
         #if i == 1:
         #    break
@@ -536,11 +739,15 @@ parser.add_argument('-mode', type=str, default='make_ie_data',
                     choices=['make_ie_data', 'prep_gen_data'],
                     help="what utility function to run")
 parser.add_argument('-test', action='store_true', help='use test data')
+parser.add_argument('-ordinal_inning_map_file', type=str, default="",
+                    help="path to file map of ordinal and inning information")
+parser.add_argument('-train_index', type=int, default=-1,
+                    help="index of training json file")
 
 args = parser.parse_args()
 
 if args.mode == 'make_ie_data':
-    save_full_sent_data(args.output_fi, path=args.input_path, multilabel_train=True)
+    save_full_sent_data(args.output_fi, path=args.input_path, train_index=args.train_index, ordinal_inning_map_file=args.ordinal_inning_map_file, multilabel_train=True)
 elif args.mode == 'prep_gen_data':
     prep_generated_data(args.gen_fi, args.dict_pfx, args.output_fi, path=args.input_path,
-                        test=args.test)
+                        test=args.test, ordinal_inning_map_file=args.ordinal_inning_map_file)

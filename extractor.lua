@@ -533,8 +533,8 @@ end
 
 
 function set_up_saved_models(opt)
-  local convens_paths = { "mlb-convie3-ep9-91-75"}
-  local lstmens_paths = { "mlb-blstmie2-ep10-92-75"}
+  local convens_paths = { "mlb-convie-ep9-91-77"}
+  local lstmens_paths = { "mlb-blstmie-ep10-91-77"}
   opt.embed_size = 200
   opt.num_filters = 200
   opt.conv_fc_layer_size = 500
