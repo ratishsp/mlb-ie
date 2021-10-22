@@ -295,6 +295,9 @@ def get_rels(entry, ents, nums, int_actions, players, teams, cities, tokes, inni
                                                 rels.append((ent, numtup, "P-BY-P-" + colname + "_pitcher", pidx))
                                                 found = True
                 if not found:
+                    if not innings and len(tokes) > numtup[1] + 1 and tokes[numtup[1]] == "-"  and tokes[numtup[1]+1] in ["out", "run"]:
+                        # no innings and sentence contains out or run, continue
+                        continue
                     rels.append((ent, numtup, "NONE", None))
             for j, inttup in enumerate(int_actions):
                 found = False
